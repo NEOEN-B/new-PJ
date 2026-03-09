@@ -1,9 +1,14 @@
+import json
 import os
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
+from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional
 
 import feedparser
+from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, url_for
 from openai import OpenAI
@@ -25,9 +30,48 @@ RSS_SOURCES = [
 MAX_ITEMS = 10
 MIN_ITEMS = 5
 CN_TZ = timezone(timedelta(hours=8))
+DATA_PATH = Path("data/summaries.json")
+LOCK = Lock()
+
+# 基础来源权重（越高越优先）
+SOURCE_WEIGHTS = {
+    "OpenAI": 4,
+    "Anthropic": 4,
+    "Google AI Blog": 4,
+    "MIT Technology Review": 3,
+    "Hugging Face": 2,
+}
 
 # 简单内存缓存，避免每次刷新都重复调用模型
 CACHE: Dict[str, List[Dict[str, str]]] = {}
+
+
+def ensure_data_file() -> None:
+    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not DATA_PATH.exists():
+        DATA_PATH.write_text("{}", encoding="utf-8")
+
+
+def load_persisted_cache() -> None:
+    ensure_data_file()
+    try:
+        persisted = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        if isinstance(persisted, dict):
+            for day_key, items in persisted.items():
+                if isinstance(day_key, str) and isinstance(items, list):
+                    CACHE[day_key] = items
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
+def persist_cache() -> None:
+    ensure_data_file()
+    try:
+        DATA_PATH.write_text(
+            json.dumps(CACHE, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        pass
 
 
 def parse_entry_time(entry) -> datetime:
@@ -42,13 +86,30 @@ def parse_entry_time(entry) -> datetime:
         return datetime.now(timezone.utc)
 
     try:
-        return parsedate_to_datetime(candidate)
+        dt = parsedate_to_datetime(candidate)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return datetime.now(timezone.utc)
 
 
-def fetch_latest_ai_articles(limit: int = 30) -> List[Dict[str, str]]:
-    """抓取最新 AI 资讯并按时间倒序排序。"""
+def normalize_title(title: str) -> str:
+    cleaned = "".join(ch.lower() for ch in title if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    return cleaned
+
+
+def is_similar_title(title: str, seen_titles: List[str], threshold: float = 0.82) -> bool:
+    current = normalize_title(title)
+    if not current:
+        return False
+    for existing in seen_titles:
+        ratio = SequenceMatcher(None, current, existing).ratio()
+        if ratio >= threshold:
+            return True
+    return False
+
+
+def fetch_latest_ai_articles(limit: int = 50) -> List[Dict[str, str]]:
+    """抓取最新 AI 资讯并做 URL + 相似标题去重。"""
     articles: List[Dict[str, str]] = []
 
     for source in RSS_SOURCES:
@@ -68,15 +129,23 @@ def fetch_latest_ai_articles(limit: int = 30) -> List[Dict[str, str]]:
                 }
             )
 
-    # 去重（同 URL）
-    dedup: Dict[str, Dict[str, str]] = {}
+    # 1) URL 去重
+    dedup_by_url: Dict[str, Dict[str, str]] = {}
     for item in articles:
-        dedup[item["url"]] = item
+        dedup_by_url[item["url"]] = item
 
-    sorted_items = sorted(
-        dedup.values(), key=lambda x: x["published"], reverse=True
-    )
-    return sorted_items[:limit]
+    # 2) 相似标题去重（保留发布时间更近/分数更高者由后续排序决定）
+    by_time = sorted(dedup_by_url.values(), key=lambda x: x["published"], reverse=True)
+    final_items: List[Dict[str, str]] = []
+    seen_titles: List[str] = []
+    for item in by_time:
+        title = item.get("title", "")
+        if is_similar_title(title, seen_titles):
+            continue
+        seen_titles.append(normalize_title(title))
+        final_items.append(item)
+
+    return final_items[:limit]
 
 
 def summarize_in_chinese(article: Dict[str, str], client: Optional[OpenAI]) -> str:
@@ -107,8 +176,16 @@ def summarize_in_chinese(article: Dict[str, str], client: Optional[OpenAI]) -> s
         return fallback
 
 
+def get_source_weight(source: str) -> int:
+    lower = source.lower()
+    for key, weight in SOURCE_WEIGHTS.items():
+        if key.lower() in lower:
+            return weight
+    return 0
+
+
 def score_article(article: Dict[str, str]) -> int:
-    """按关键词给资讯打分，用于挑选更重要内容。"""
+    """按关键词、时效和来源权重给资讯打分。"""
     text = f"{article['title']} {article['raw_summary']}".lower()
     score = 0
 
@@ -131,26 +208,26 @@ def score_article(article: Dict[str, str]) -> int:
         if kw in text:
             score += 2
 
-    # 新近内容加分
     age_hours = (datetime.now(timezone.utc) - article["published"]).total_seconds() / 3600
     if age_hours <= 24:
         score += 3
     elif age_hours <= 72:
         score += 1
 
+    score += get_source_weight(article.get("source", ""))
     return score
 
 
-def build_daily_digest() -> List[Dict[str, str]]:
-    """构建当天资讯摘要列表（5~10 条）。"""
+def build_daily_digest(force_refresh: bool = False) -> List[Dict[str, str]]:
+    """构建当天资讯摘要列表（5~10 条），并持久化到本地文件。"""
     day_key = datetime.now(CN_TZ).strftime("%Y-%m-%d")
-    if day_key in CACHE:
+    if not force_refresh and day_key in CACHE:
         return CACHE[day_key]
 
     api_key = os.getenv("OPENAI_API_KEY")
     client = OpenAI(api_key=api_key) if api_key else None
 
-    candidates = fetch_latest_ai_articles(limit=40)
+    candidates = fetch_latest_ai_articles(limit=50)
     ranked = sorted(candidates, key=score_article, reverse=True)
 
     target_count = min(MAX_ITEMS, max(MIN_ITEMS, len(ranked)))
@@ -168,8 +245,21 @@ def build_daily_digest() -> List[Dict[str, str]]:
             }
         )
 
-    CACHE[day_key] = result
+    with LOCK:
+        CACHE[day_key] = result
+        # 仅保留近 7 天，控制文件大小
+        recent_keys = sorted(CACHE.keys(), reverse=True)[:7]
+        for k in list(CACHE.keys()):
+            if k not in recent_keys:
+                CACHE.pop(k, None)
+        persist_cache()
+
     return result
+
+
+def scheduled_daily_refresh() -> None:
+    """每天 08:00 自动刷新当天资讯。"""
+    build_daily_digest(force_refresh=True)
 
 
 @app.route("/")
@@ -182,15 +272,37 @@ def index():
     )
 
 
-@app.route('/refresh', methods=['POST'])
+@app.route("/refresh", methods=["POST"])
 def refresh_news():
     """手动刷新当天资讯缓存并回到首页。"""
-    day_key = datetime.now(CN_TZ).strftime("%Y-%m-%d")
-    CACHE.pop(day_key, None)
-
-    # 保留一个可扩展参数，便于未来接入按源刷新
     _ = request.form.get("source", "all")
+    build_daily_digest(force_refresh=True)
     return redirect(url_for("index"))
+
+
+def start_scheduler() -> BackgroundScheduler:
+    scheduler = BackgroundScheduler(timezone=CN_TZ)
+    scheduler.add_job(
+        scheduled_daily_refresh,
+        trigger="cron",
+        hour=8,
+        minute=0,
+        id="daily_8am_refresh",
+        replace_existing=True,
+    )
+    scheduler.start()
+    return scheduler
+
+
+def should_start_scheduler() -> bool:
+    debug_mode = os.getenv("FLASK_DEBUG", "true").lower() in {"1", "true", "yes"}
+    if not debug_mode:
+        return True
+    return os.getenv("WERKZEUG_RUN_MAIN") == "true"
+
+
+load_persisted_cache()
+SCHEDULER = start_scheduler() if should_start_scheduler() else None
 
 
 if __name__ == "__main__":
