@@ -17,7 +17,6 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# 常用 AI 资讯 RSS 源，可按需扩展
 RSS_SOURCES = [
     "https://openai.com/blog/rss.xml",
     "https://www.anthropic.com/news/rss.xml",
@@ -32,8 +31,8 @@ MIN_ITEMS = 5
 CN_TZ = timezone(timedelta(hours=8))
 DATA_PATH = Path("data/summaries.json")
 LOCK = Lock()
+LAST_ERROR = ""
 
-# 基础来源权重（越高越优先）
 SOURCE_WEIGHTS = {
     "OpenAI": 4,
     "Anthropic": 4,
@@ -42,8 +41,18 @@ SOURCE_WEIGHTS = {
     "Hugging Face": 2,
 }
 
-# 简单内存缓存，避免每次刷新都重复调用模型
 CACHE: Dict[str, List[Dict[str, str]]] = {}
+
+
+def set_last_error(message: str = "") -> None:
+    global LAST_ERROR
+    with LOCK:
+        LAST_ERROR = message
+
+
+def get_last_error() -> str:
+    with LOCK:
+        return LAST_ERROR
 
 
 def ensure_data_file() -> None:
@@ -61,7 +70,7 @@ def load_persisted_cache() -> None:
                 if isinstance(day_key, str) and isinstance(items, list):
                     CACHE[day_key] = items
     except (json.JSONDecodeError, OSError):
-        pass
+        set_last_error("历史摘要读取失败，系统将重新抓取资讯。")
 
 
 def persist_cache() -> None:
@@ -71,11 +80,10 @@ def persist_cache() -> None:
             json.dumps(CACHE, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     except OSError:
-        pass
+        set_last_error("摘要保存失败，请检查 data 目录写入权限。")
 
 
 def parse_entry_time(entry) -> datetime:
-    """解析 RSS 条目时间，失败时回退到当前时间。"""
     candidate = (
         entry.get("published")
         or entry.get("updated")
@@ -93,23 +101,17 @@ def parse_entry_time(entry) -> datetime:
 
 
 def normalize_title(title: str) -> str:
-    cleaned = "".join(ch.lower() for ch in title if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
-    return cleaned
+    return "".join(ch.lower() for ch in title if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
 
 
 def is_similar_title(title: str, seen_titles: List[str], threshold: float = 0.82) -> bool:
     current = normalize_title(title)
     if not current:
         return False
-    for existing in seen_titles:
-        ratio = SequenceMatcher(None, current, existing).ratio()
-        if ratio >= threshold:
-            return True
-    return False
+    return any(SequenceMatcher(None, current, existing).ratio() >= threshold for existing in seen_titles)
 
 
 def fetch_latest_ai_articles(limit: int = 50) -> List[Dict[str, str]]:
-    """抓取最新 AI 资讯并做 URL + 相似标题去重。"""
     articles: List[Dict[str, str]] = []
 
     for source in RSS_SOURCES:
@@ -117,24 +119,24 @@ def fetch_latest_ai_articles(limit: int = 50) -> List[Dict[str, str]]:
         source_title = feed.feed.get("title", source)
 
         for entry in feed.entries:
-            published = parse_entry_time(entry)
             summary = (entry.get("summary") or entry.get("description") or "").strip()
             articles.append(
                 {
                     "title": entry.get("title", "无标题"),
                     "url": entry.get("link", "#"),
                     "source": source_title,
-                    "published": published,
+                    "published": parse_entry_time(entry),
                     "raw_summary": summary,
                 }
             )
 
-    # 1) URL 去重
+    if not articles:
+        raise RuntimeError("资讯抓取失败：暂时无法获取 RSS 内容，请稍后重试。")
+
     dedup_by_url: Dict[str, Dict[str, str]] = {}
     for item in articles:
         dedup_by_url[item["url"]] = item
 
-    # 2) 相似标题去重（保留发布时间更近/分数更高者由后续排序决定）
     by_time = sorted(dedup_by_url.values(), key=lambda x: x["published"], reverse=True)
     final_items: List[Dict[str, str]] = []
     seen_titles: List[str] = []
@@ -149,9 +151,7 @@ def fetch_latest_ai_articles(limit: int = 50) -> List[Dict[str, str]]:
 
 
 def summarize_in_chinese(article: Dict[str, str], client: Optional[OpenAI]) -> str:
-    """使用 GPT 生成中文摘要；若不可用则回退到原文简介截断。"""
     fallback = article["raw_summary"][:280] or "该资讯暂无可用摘要，请点击查看原文。"
-
     if client is None:
         return fallback
 
@@ -185,26 +185,12 @@ def get_source_weight(source: str) -> int:
 
 
 def score_article(article: Dict[str, str]) -> int:
-    """按关键词、时效和来源权重给资讯打分。"""
     text = f"{article['title']} {article['raw_summary']}".lower()
     score = 0
-
-    high_impact_keywords = [
-        "release",
-        "launched",
-        "model",
-        "benchmark",
-        "paper",
-        "open-source",
-        "api",
-        "agent",
-        "multimodal",
-        "reasoning",
-        "sota",
-        "breakthrough",
-    ]
-
-    for kw in high_impact_keywords:
+    for kw in [
+        "release", "launched", "model", "benchmark", "paper", "open-source",
+        "api", "agent", "multimodal", "reasoning", "sota", "breakthrough",
+    ]:
         if kw in text:
             score += 2
 
@@ -214,28 +200,24 @@ def score_article(article: Dict[str, str]) -> int:
     elif age_hours <= 72:
         score += 1
 
-    score += get_source_weight(article.get("source", ""))
-    return score
+    return score + get_source_weight(article.get("source", ""))
 
 
 def build_daily_digest(force_refresh: bool = False) -> List[Dict[str, str]]:
-    """构建当天资讯摘要列表（5~10 条），并持久化到本地文件。"""
     day_key = datetime.now(CN_TZ).strftime("%Y-%m-%d")
     if not force_refresh and day_key in CACHE:
         return CACHE[day_key]
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    client = OpenAI(api_key=api_key) if api_key else None
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        client = OpenAI(api_key=api_key) if api_key else None
+        candidates = fetch_latest_ai_articles(limit=50)
+        ranked = sorted(candidates, key=score_article, reverse=True)
 
-    candidates = fetch_latest_ai_articles(limit=50)
-    ranked = sorted(candidates, key=score_article, reverse=True)
+        target_count = min(MAX_ITEMS, max(MIN_ITEMS, len(ranked)))
+        selected = ranked[:target_count]
 
-    target_count = min(MAX_ITEMS, max(MIN_ITEMS, len(ranked)))
-    selected = ranked[:target_count]
-
-    result = []
-    for item in selected:
-        result.append(
+        result = [
             {
                 "title": item["title"],
                 "url": item["url"],
@@ -243,41 +225,54 @@ def build_daily_digest(force_refresh: bool = False) -> List[Dict[str, str]]:
                 "published": item["published"].astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M"),
                 "summary": summarize_in_chinese(item, client),
             }
-        )
+            for item in selected
+        ]
 
-    with LOCK:
-        CACHE[day_key] = result
-        # 仅保留近 7 天，控制文件大小
-        recent_keys = sorted(CACHE.keys(), reverse=True)[:7]
-        for k in list(CACHE.keys()):
-            if k not in recent_keys:
-                CACHE.pop(k, None)
-        persist_cache()
+        with LOCK:
+            CACHE[day_key] = result
+            recent_keys = sorted(CACHE.keys(), reverse=True)[:7]
+            for key in list(CACHE.keys()):
+                if key not in recent_keys:
+                    CACHE.pop(key, None)
+            persist_cache()
 
-    return result
+        set_last_error("")
+        return result
+    except Exception:
+        set_last_error("抓取失败：网络或订阅源可能暂时不可用，请稍后点击“手动刷新资讯”重试。")
+        return CACHE.get(day_key, [])
 
 
 def scheduled_daily_refresh() -> None:
-    """每天 08:00 自动刷新当天资讯。"""
     build_daily_digest(force_refresh=True)
 
 
 @app.route("/")
 def index():
-    items = build_daily_digest()
+    selected_source = request.args.get("source", "all")
+    all_items = build_daily_digest()
+    available_sources = sorted({item.get("source", "未知来源") for item in all_items})
+
+    if selected_source != "all":
+        items = [item for item in all_items if item.get("source") == selected_source]
+    else:
+        items = all_items
+
     return render_template(
         "index.html",
         items=items,
         updated_at=datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M"),
+        error_message=get_last_error(),
+        sources=available_sources,
+        selected_source=selected_source,
     )
 
 
 @app.route("/refresh", methods=["POST"])
 def refresh_news():
-    """手动刷新当天资讯缓存并回到首页。"""
-    _ = request.form.get("source", "all")
+    selected_source = request.form.get("source", "all")
     build_daily_digest(force_refresh=True)
-    return redirect(url_for("index"))
+    return redirect(url_for("index", source=selected_source))
 
 
 def start_scheduler() -> BackgroundScheduler:
