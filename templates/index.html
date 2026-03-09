@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>每日 AI 资讯卡片</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="page-header">
+        <div>
+          <p class="badge">每日更新</p>
+          <h1>AI 资讯早报</h1>
+          <p class="meta">自动更新时间：{{ updated_at }}（北京时间）</p>
+        </div>
+        <form action="{{ url_for('refresh_news') }}" method="post">
+          <button type="submit" class="refresh-btn">手动刷新资讯</button>
+        </form>
+      </header>
+
+      <section class="news-grid">
+        {% for item in items %}
+        <article class="card">
+          <h2>
+            <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">{{ item.title }}</a>
+          </h2>
+          <p class="info">{{ item.source }} · {{ item.published }}</p>
+          <p class="summary">{{ item.summary }}</p>
+          <a class="readmore" href="{{ item.url }}" target="_blank" rel="noopener noreferrer">查看原文</a>
+        </article>
+        {% endfor %}
+      </section>
+    </main>
+  </body>
+</html>
