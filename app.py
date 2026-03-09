@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Dict, List, Optional
 
 import feedparser
@@ -30,7 +30,7 @@ MAX_ITEMS = 10
 MIN_ITEMS = 5
 CN_TZ = timezone(timedelta(hours=8))
 DATA_PATH = Path("data/summaries.json")
-LOCK = Lock()
+LOCK = RLock()
 LAST_ERROR = ""
 
 SOURCE_WEIGHTS = {
